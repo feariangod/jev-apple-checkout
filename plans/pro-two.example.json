@@ -1,0 +1,85 @@
+{
+  "products": [
+    {
+      "name": "iPhone 18 Pro 512GB 黑色",
+      "url": "https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro",
+      "options": [
+        {
+          "name": "model",
+          "pattern": "^iPhone 18 Pro(?: Max)? 6\\.",
+          "goal": "选择 iPhone 18 Pro 6.3 英寸，不是 Pro Max。",
+          "expected": "^iPhone 18 Pro 6\\.3"
+        },
+        {
+          "name": "color",
+          "pattern": "^(黑色|银色|冰川蓝色|勃艮第酒红色)$",
+          "goal": "选择黑色。",
+          "expected": "^黑色$"
+        },
+        {
+          "name": "capacity",
+          "pattern": "^(256GB|512GB|1TB|2TB)",
+          "goal": "选择512GB。",
+          "expected": "^512GB"
+        },
+        {
+          "name": "trade",
+          "pattern": "^(不折抵换购|添加折抵设备)",
+          "goal": "不折抵换购。",
+          "expected": "^不折抵换购"
+        },
+        {
+          "name": "care",
+          "pattern": "^(不加 AppleCare\\+|AppleCare\\+ 服务计划)",
+          "goal": "不加 AppleCare+ 服务计划。",
+          "expected": "^不加 AppleCare\\+"
+        }
+      ],
+      "entry_url": "https://apple.com.cn/shop/buy-iphone/iphone-18-pro/mjtc4ch/a"
+    },
+    {
+      "name": "iPhone 18 Pro 512GB 银色",
+      "url": "https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro",
+      "options": [
+        {
+          "name": "model",
+          "pattern": "^iPhone 18 Pro(?: Max)? 6\\.",
+          "goal": "选择 iPhone 18 Pro 6.3 英寸，不是 Pro Max。",
+          "expected": "^iPhone 18 Pro 6\\.3"
+        },
+        {
+          "name": "color",
+          "pattern": "^(黑色|银色|冰川蓝色|勃艮第酒红色)$",
+          "goal": "选择银色。",
+          "expected": "^银色$"
+        },
+        {
+          "name": "capacity",
+          "pattern": "^(256GB|512GB|1TB|2TB)",
+          "goal": "选择512GB。",
+          "expected": "^512GB"
+        },
+        {
+          "name": "trade",
+          "pattern": "^(不折抵换购|添加折抵设备)",
+          "goal": "不折抵换购。",
+          "expected": "^不折抵换购"
+        },
+        {
+          "name": "care",
+          "pattern": "^(不加 AppleCare\\+|AppleCare\\+ 服务计划)",
+          "goal": "不加 AppleCare+ 服务计划。",
+          "expected": "^不加 AppleCare\\+"
+        }
+      ],
+      "entry_url": "https://apple.com.cn/shop/buy-iphone/iphone-18-pro/mjtd4ch/a"
+    }
+  ],
+  "product_names": [
+    "iPhone 18 Pro 512GB 黑色",
+    "iPhone 18 Pro 512GB 银色"
+  ],
+  "expected_total": 23998,
+  "max_total": 23998,
+  "load_timeout_seconds": 120
+}
