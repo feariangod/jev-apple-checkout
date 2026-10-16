@@ -94,8 +94,8 @@ def test_auth_requires_human_without_mutation(setup):
 
 def test_wrong_model_option_fails_before_click(setup):
     clock, make = setup
-    driver = Driver(lambda: state('花呗分期','支付宝'))
-    with pytest.raises(Halt, match='inconsistent'):
+    driver = Driver(lambda: state('花呗分期'))
+    with pytest.raises(Halt, match='consistent'):
         make(driver).action('pay','^(花呗分期|支付宝)$','Alipay',lambda s:False,
                             validator=lambda e:e['label']=='支付宝')
     assert not driver.clicks
@@ -125,11 +125,13 @@ def test_changed_plan_refuses_old_journal(setup):
     with pytest.raises(Halt, match='another purchase plan'):
         make(Driver(lambda:state('ready')))
 
-def test_unique_button_does_not_call_jev():
+def test_unique_button_still_calls_jev():
     jev = Jev.__new__(Jev)
-    jev.choose = lambda *a: (_ for _ in ()).throw(AssertionError('unnecessary model request'))
+    jev.calls=[]
+    jev.choose = lambda *a: {'choice':'0','latency_ms':1}
     button = element('继续填写送货地址')
     assert jev.pick(state(), [button], 'continue') is button
+    assert len(jev.calls)==1
 
 def test_bag_title_does_not_mean_body_loaded():
     loading = State('apple.com.cn/shop/bag', '购物袋 - Apple', [])
@@ -177,13 +179,13 @@ def one_product():
     return {'url':'https://www.apple.com.cn/shop/buy-iphone/iphone-duo',
             'options':[{'name':'color','pattern':'^夜空色$','expected':'^夜空色$','goal':'夜空色'}]}
 
-def test_one_second_refresh_stops_as_soon_as_option_available(setup):
+def test_delayed_controls_are_selected_without_refresh(setup):
     clock, make = setup
     driver = RefreshDriver(clock, available_at=2.5)
     engine = make(driver)
     engine.configure(0, one_product())
-    assert driver.refreshes == [1, 2]
-    assert clock() == 3 and driver.clicks == ['夜空色']
+    assert driver.refreshes == []
+    assert clock() == 2.5 and driver.clicks == ['夜空色']
 
 def test_ready_page_selects_without_wait_or_refresh(setup):
     clock, make = setup
@@ -192,12 +194,12 @@ def test_ready_page_selects_without_wait_or_refresh(setup):
     assert clock() == 0 and not driver.refreshes
     assert driver.clicks == ['夜空色']
 
-def test_slow_cua_refresh_does_not_add_an_extra_one_second_sleep(setup):
+def test_reload_cost_is_not_paid_while_loading(setup):
     clock, make = setup
     driver = RefreshDriver(clock, available_at=3.5, refresh_cost=1.4)
     make(driver).configure(0, one_product())
-    assert driver.refreshes == [1, 2.4]
-    assert clock() == pytest.approx(3.8)
+    assert driver.refreshes == []
+    assert clock() == pytest.approx(3.5)
 
 def test_refresh_deadline_stops_without_indefinite_loop(setup):
     clock, make = setup
@@ -205,7 +207,7 @@ def test_refresh_deadline_stops_without_indefinite_loop(setup):
     engine = make(driver); engine.plan['product_wait_seconds'] = 3
     with pytest.raises(Halt, match='timeout: product'):
         engine.configure(0, one_product())
-    assert driver.refreshes == [1, 2]
+    assert driver.refreshes == []
 
 def test_refresh_never_runs_on_checkout_or_auth(setup):
     clock, make = setup
@@ -300,10 +302,13 @@ def test_full_two_product_flow_skips_intermediate_bag_and_stops_at_alipay(tmp_pa
     assert driver.clicks.count('立即下单')==1
     assert json.loads(journal.read_text())['status']=='alipay_reached'
     before=list(driver.clicks)
+    saved=json.loads(journal.read_text())
+    saved.update(phase='configure', product_index=1)  # Human checkout left an old phase.
+    journal.write_text(json.dumps(saved))
     runner.run(args)  # Re-running the same journal never creates a second order.
     assert driver.clicks==before
 
-def test_refresh_while_waiting_for_add_reselects_lost_options(setup):
+def test_delayed_add_button_preserves_selected_options(setup):
     clock, make = setup
     class Resetting(RefreshDriver):
         def __init__(self):
@@ -313,7 +318,7 @@ def test_refresh_while_waiting_for_add_reselects_lost_options(setup):
             controls=[element('夜空色','AXRadioButton',int(self.selected))]
             if self.selected:
                 controls.append(element('512GB','AXRadioButton',int(self.capacity)))
-            if self.refreshes and self.capacity:
+            if clock() >= 2 and self.capacity:
                 controls.append(element('添加到购物袋'))
             return State(self.url,'Duo',controls)
         def click(self,e):
@@ -323,8 +328,8 @@ def test_refresh_while_waiting_for_add_reselects_lost_options(setup):
     driver=Resetting();product=one_product()
     product['options'].append({'name':'capacity','pattern':'^512GB$','expected':'^512GB$','goal':'512GB'})
     result=make(driver).configure(0,product,require_add=True)
-    assert driver.refreshes==[1]
-    assert driver.clicks==['夜空色','512GB','夜空色']
+    assert driver.refreshes==[]
+    assert driver.clicks==['夜空色','512GB']
     assert result.radio_selected('夜空色') and result.radio_selected('512GB')
 
 def test_pending_submit_forbids_product_refresh(setup):
@@ -335,7 +340,7 @@ def test_pending_submit_forbids_product_refresh(setup):
         engine.product_wait(lambda s:False,one_product(),clock()+10)
     assert not driver.refreshes
 
-def test_read_latency_is_budgeted_before_refresh_tick(setup):
+def test_read_latency_is_budgeted_in_no_refresh_polling(setup):
     clock, make = setup
     class WithReadCost(RefreshDriver):
         def read(self):
@@ -344,8 +349,8 @@ def test_read_latency_is_budgeted_before_refresh_tick(setup):
             return result
     driver=WithReadCost(clock,available_at=2.5)
     make(driver).configure(0,one_product())
-    assert len(driver.refreshes)==2
-    assert driver.refreshes[1]-driver.refreshes[0]==pytest.approx(1.02)
+    assert not driver.refreshes
+    assert 2.5 <= clock() < 3.1
 
 def test_verified_entry_skips_preselected_options(setup):
     clock, make = setup
@@ -396,16 +401,16 @@ def test_no_refresh_during_slow_following_option_load(setup):
     make(driver).configure(0,product)
     assert not driver.refreshes and driver.clicks==['夜空色','512GB']
 
-def test_lost_reversible_click_reselects_once_without_refresh(setup):
+def test_lost_click_times_out_without_repeating_click(setup):
     clock, make = setup
     class LostFirst(RefreshDriver):
         def click(self,e):
             self.clicks.append(e['label'])
             self.selected=len(self.clicks)>1
     driver=LostFirst(clock,0);engine=make(driver)
-    engine.configure(0,one_product())
-    assert driver.clicks==['夜空色','夜空色'] and not driver.refreshes
-    assert engine.record['events'][-1]['reversible_retries']==1
+    with pytest.raises(Halt, match='timeout'):
+        engine.configure(0,one_product())
+    assert driver.clicks==['夜空色'] and not driver.refreshes
 
 def test_short_snapshot_missing_target_falls_back_without_reclick(setup):
     clock, make = setup
@@ -513,10 +518,210 @@ def test_explicit_full_observation_does_not_read_twice(setup):
     driver.read_full=lambda:state('complete')
     assert make(driver).observe(full=True).text=='complete'
 
-def test_refresh_fronts_exact_window_before_app_menu():
-    from purchase_runner import Cua
-    c=Cua();c.pid=12;c.window=34;calls=[]
-    c.call=lambda name,data:calls.append((name,data))
-    c.refresh()
-    assert [name for name,_ in calls]==['bring_to_front','invoke_menu']
-    assert all(data['pid']==12 and data['window_id']==34 for _,data in calls)
+
+def test_exact_authorized_option_requires_model_after_safety_filter(setup):
+    clock, make = setup
+    choices = [element('花呗分期', 'AXRadioButton', 0), element('支付宝', 'AXRadioButton', 0)]
+    driver = Driver(lambda: State('apple.com.cn/shop/checkout', 'payment', choices))
+    def click(e):
+        driver.clicks.append(e['label']); e['value'] = 1
+    driver.click = click
+    engine = make(driver)
+    engine.jev = Jev.__new__(Jev)
+    engine.jev.cache, engine.jev.calls = {}, []
+    engine.jev.choose = lambda *a: {'choice':'0','latency_ms':1}
+    engine.action('alipay', '^(花呗分期|支付宝)$', 'Alipay', lambda s:s.radio_selected('支付宝'),
+                  validator=lambda e:e['label'] == '支付宝')
+    assert driver.clicks == ['支付宝']
+
+
+def test_inconsistent_picker_cannot_bypass_exact_selection(setup):
+    clock, make = setup
+    driver = Driver(lambda: state('支付宝'))
+    engine = make(driver)
+    engine.jev.pick = lambda *a: element('花呗分期')
+    with pytest.raises(Halt, match='inconsistent'):
+        engine.action('alipay', '^支付宝$', 'Alipay', lambda s:False,
+                      validator=lambda e:e['label'] == '支付宝')
+    assert driver.clicks == []
+
+
+def test_auth_resumes_pending_checkout_in_same_process_without_reclick(setup):
+    clock, make = setup
+    def page():
+        if not driver.clicks: return state('结账', url='apple.com.cn/shop/bag')
+        if clock() < 4: return state('密码', url='secure10.www.apple.com.cn/shop/signIn')
+        return state('继续填写送货地址')
+    driver = Driver(page)
+    engine = make(driver); engine.auth_wait_seconds = 10
+    engine.action('checkout', '^结账$', 'checkout',
+                  lambda s:bool(s.controls('^继续填写送货地址$')), kind='checkout')
+    assert driver.clicks == ['结账']
+    assert clock() == 4
+    assert engine.record['mutations']['checkout']['status'] == 'confirmed'
+    event = next(e for e in engine.record['events'] if e['key'] == 'auth_wait')
+    assert event['status'] == 'auth_screen_left' and event['duration_ms'] == 4000
+    assert not any(k in event for k in ('url', 'elements', 'password'))
+
+
+def test_auth_wait_does_not_spend_normal_page_timeout(setup):
+    clock, make = setup
+    def page():
+        if clock() < 4: return state('密码', url='apple.com.cn/shop/signIn')
+        return state('ready' if clock() >= 5 else 'loading')
+    driver = Driver(page); engine = make(driver); engine.auth_wait_seconds = 10
+    assert engine.wait(lambda s:'ready' in s.text, 'after login', timeout=2).text == 'ready'
+    assert clock() == 5
+
+
+def test_auth_timeout_preserves_pending_submit_without_retry(setup):
+    clock, make = setup
+    driver = Driver(lambda:state('密码', url='apple.com.cn/shop/signIn'))
+    engine = make(driver); engine.auth_wait_seconds = 2
+    engine.record['mutations']['submit'] = {'kind':'submit','status':'attempted'}
+    with pytest.raises(Halt, match='authentication wait expired'):
+        engine.action('submit', '^立即下单$', 'submit', lambda s:'等待付款' in s.text, kind='submit')
+    assert driver.clicks == [] and clock() == 2
+    saved = json.loads(engine.path.read_text())
+    assert saved['mutations']['submit']['status'] == 'attempted'
+    assert saved['events'][-1]['status'] == 'timeout'
+
+
+def test_auth_partial_snapshot_does_not_falsely_resume(setup):
+    clock, make = setup
+    full = state('密码', url='apple.com.cn/shop/signIn')
+    driver = Driver(lambda: State('apple.com.cn', 'loading', [], complete=False))
+    driver.read_full = lambda: full if clock()<2 else state('ready')
+    engine = make(driver); engine.auth_wait_seconds = 5; engine.cached = full
+    assert engine.wait(lambda s:'ready' in s.text, 'ready').text == 'ready'
+    assert clock() == 2 and not driver.clicks
+
+
+def test_checkout_reuses_positive_short_snapshot_until_final_review(setup):
+    clock, make = setup
+    class Stages(Driver):
+        def __init__(self):
+            self.page = state('继续填写送货地址')
+            self.full_reads = 0
+            super().__init__(lambda:self.page)
+        def read(self):
+            s = super().read()
+            return State(s.url, s.title, s.elements, complete=False)
+        def read_full(self):
+            self.full_reads += 1
+            return self.page
+        def click(self, e):
+            super().click(e)
+            if e['label']=='继续填写送货地址': self.page=state('继续选择付款方式')
+            elif e['label']=='继续选择付款方式':
+                self.page=State('apple.com.cn/shop/checkout', 'payment',
+                    [element('支付宝','AXRadioButton',0),element('检查订单')])
+            elif e['label']=='支付宝': e['value']=1
+            elif e['label']=='检查订单':
+                self.page=state('iPhone Duo 512GB 星光白色','总计 RMB 17,999','支付宝','立即下单')
+            else: raise AssertionError(e['label'])
+    driver = Stages()
+    assert make(driver).checkout(submit=False)=='review_ready'
+    assert driver.full_reads==2  # Entry and final financial review only.
+    assert '立即下单' not in driver.clicks
+
+
+def test_product_auth_wait_never_refreshes_login(setup):
+    clock, make = setup
+    class Login(RefreshDriver):
+        def page(self):
+            if clock()<2: return state('密码', url='apple.com.cn/shop/signIn')
+            return State(self.url,'Duo',[element('夜空色','AXRadioButton',1)])
+    driver=Login(clock,0); engine=make(driver); engine.auth_wait_seconds=5
+    result=engine.product_wait(lambda s:s.radio_selected('夜空色'),one_product(),clock()+1)
+    assert result.radio_selected('夜空色') and clock()==2
+    assert not driver.refreshes and not driver.clicks
+
+
+def test_apple_404_stops_without_waiting_or_repeating_add(setup):
+    clock, make = setup
+    driver=Driver(lambda:State('apple.com.cn/shop/error','Page Not Found - Apple',[])
+                  if driver.clicks else state('添加到购物袋'))
+    engine=make(driver)
+    with pytest.raises(Halt,match='page_not_found'):
+        engine.action('add:0','^添加到购物袋$','add',lambda s:bool(s.controls('^查看购物袋$')),kind='add')
+    assert driver.clicks==['添加到购物袋'] and clock()==0
+    assert engine.record['mutations']['add:0']['status']=='attempted'
+
+
+def test_failure_context_records_route_without_private_url_or_page_values(setup):
+    clock,make=setup
+    driver=Driver(lambda:State('https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/sku?atbtoken=SECRET_TOKEN&add-to-cart=yes',
+                              'Page Not Found - Apple',[element('PRIVATE_ADDRESS')]))
+    engine=make(driver);engine.observe();engine.finish('page_not_found')
+    saved=engine.path.read_text()
+    assert 'SECRET_TOKEN' not in saved and 'PRIVATE_ADDRESS' not in saved and 'atbtoken' not in saved
+    assert engine.record['runs'][-1]['last_observed_page']=={
+        'route_kind':'product','page_not_found':True,'maintenance_notice':False,'add_form_parameters_in_url':True}
+
+
+@pytest.mark.parametrize('notice', ['在我们带你进店开始预购前，请勿关闭此页面。', '快了快了。马上可以预购了。', ''])
+def test_loading_that_restarts_on_reload_completes_without_reload(setup, notice):
+    clock, make = setup
+    class Queue(RefreshDriver):
+        def page(self):
+            if clock() < self.available_at:
+                return State(self.url, 'Apple Store', [element(notice, 'AXStaticText')])
+            return super().page()
+        def refresh(self):
+            super().refresh()
+            self.available_at = clock() + 4
+    driver = Queue(clock, 4)
+    make(driver).configure(0, one_product())
+    assert clock() == 4 and not driver.refreshes
+    assert driver.clicks == ['夜空色']
+
+
+def test_navigation_waits_for_delayed_url_without_reload(setup):
+    clock, make = setup
+    class Navigation(RefreshDriver):
+        def open(self, url): self.target = url
+        def page(self):
+            if clock() < 3:
+                return State(self.url, 'old product', [])
+            return State(self.target, 'bag', [element('你的购物袋中没有商品。', 'AXStaticText')])
+    driver = Navigation(clock, 0)
+    result = make(driver).navigate('https://www.apple.com.cn/shop/bag', lambda s:s.bag_ready)
+    assert result.bag_ready and not driver.refreshes and clock() == 3
+
+
+def test_checkpoint_retains_partial_metrics(setup):
+    clock, make = setup
+    driver = Driver(lambda: state('loading'))
+    engine = make(driver)
+    driver.metrics.append({'tool':'get_window_state','ms':100})
+    engine.pause(2)
+    engine.checkpoint('configure', 1)
+    saved = json.loads(engine.path.read_text())['runs'][-1]
+    assert saved['status'] == 'running'
+    assert saved['elapsed_ms'] == 2000 and saved['sleep_ms'] == 2000
+    assert saved['driver_metrics'] == driver.metrics
+
+
+def test_resume_detects_human_checkout_without_returning_to_product(setup, monkeypatch, tmp_path):
+    import purchase_runner as runner
+    from types import SimpleNamespace
+    clock, make = setup
+    review = state('iPhone Duo 512GB 星光白色','总计 RMB 17,999','支付宝','立即下单')
+    driver = Driver(lambda: review)
+    driver.bind = lambda: None
+    driver.open = lambda url: pytest.fail('Must not navigate back from checkout')
+    engine = make(driver)
+    engine.plan['products'] = [one_product()]
+    import hashlib
+    engine.record['plan_hash'] = hashlib.sha256(json.dumps(engine.plan, sort_keys=True).encode()).hexdigest()
+    engine.checkpoint('configure', 0)
+    engine.finish('interrupted')
+    plan = tmp_path/'resume-plan.json';plan.write_text(json.dumps(engine.plan))
+    monkeypatch.setattr(runner, 'Cua', lambda **kw: driver)
+    monkeypatch.setattr(runner, 'Jev', Picker)
+    runner.run(SimpleNamespace(plan=str(plan),journal=str(engine.path),window_id=1,
+                              resume_checkout=False,stop_at='review',submit=False))
+    saved=json.loads(engine.path.read_text())
+    assert saved['phase']=='checkout' and saved['status']=='review_ready'
+    assert not driver.clicks

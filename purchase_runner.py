@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qsl
 
 CLI = os.environ.get('CUA_DRIVER') or shutil.which('cua-driver') or str(Path.home() / '.local/bin/cua-driver')
 ACTION_ROLES = {'AXButton', 'AXRadioButton', 'AXCheckBox', 'AXPopUpButton', 'AXLink'}
@@ -26,9 +26,6 @@ def semantic(label):
 
 class Halt(RuntimeError):
     pass
-
-class ProductReloaded(Exception):
-    """A safe product reload invalidated reversible radio state."""
 
 @contextmanager
 def journal_lock(path):
@@ -151,6 +148,7 @@ class Cua:
         d = self.call('get_window_state', {'pid': self.pid, 'window_id': self.window,
                       'session': self.session, 'include_screenshot': False,
                       'max_elements': 1600 if full else 600})
+        self.metrics[-1]['read_mode'] = 'full' if full else 'short'
         web, elements = set(), []
         for e in d.get('elements', []):
             if e.get('role') == 'AXWebArea' or e.get('parent_index') in web:
@@ -174,14 +172,9 @@ class Cua:
         return self.call('click', {'pid': self.pid, 'window_id': self.window,
                          'session': self.session, 'element_token': element['element_token']})
 
-    def refresh(self):
-        # Observed Chrome menu labels. Exact native resolution fails closed if absent.
-        # Chrome app menus can act on its active window despite window_id. Front
-        # the exact work window before menu dispatch; never refresh a payment tab.
-        self.call('bring_to_front', {'pid': self.pid, 'window_id': self.window,
-                         'session': self.session})
-        return self.call('invoke_menu', {'pid': self.pid, 'window_id': self.window,
-                         'session': self.session, 'path': ['显示', '重新加载此页']})
+    def fill_field(self, element, value):
+        return self.call('set_value', {'pid': self.pid, 'window_id': self.window,
+                         'session': self.session, 'element_token': element['element_token'], 'value': value})
 
 class Jev:
     def __init__(self):
@@ -190,31 +183,25 @@ class Jev:
         os.environ.setdefault('TYPESAFE_MODEL', 'jev-1.13.0')
         from jev_choice.model import choose
         self.choose = choose
-        self.cache, self.calls = {}, []
+        self.calls = []
 
     def pick(self, state, candidates, goal):
-        # Unique, already-specified buttons require no model request.
-        if len(candidates) == 1:
-            return candidates[0]
-        key = (goal, tuple(semantic(e.get('label')) for e in candidates))
-        if key in self.cache:
-            return next(e for e in candidates if semantic(e.get('label')) == self.cache[key])
         actions = [{'id': str(i), 'node': i, 'label': norm(e.get('label')), 'role': e['role'],
                     'kind': 'click', 'value': str(e.get('value', '')),
                     'checked': str(str(e.get('value')) == '1').lower()}
                    for i, e in enumerate(candidates)]
-        page = {'url': state.url.split('?')[0], 'title': state.title,
+        page = {'url': 'https://www.apple.com.cn/', 'title': 'Apple purchase workflow',
                 'text': '\n'.join(a['label'] for a in actions), 'actions': actions}
         answer = self.choose(page, goal, [])  # Never carry a previous product's completion history.
         self.calls.append({'ms': answer['latency_ms'], 'goal': goal})
         if answer['choice'] not in {a['id'] for a in actions}:
             raise Halt('Jev returned DONE/BLOCKED before the selected option was observed')
         result = candidates[int(answer['choice'])]
-        self.cache[key] = semantic(result.get('label'))
         return result
 
 class Engine:
-    def __init__(self, driver, jev, journal, plan, clock=time.monotonic, sleep=time.sleep):
+    def __init__(self, driver, jev, journal, plan, clock=time.monotonic, sleep=time.sleep,
+                 auth_wait_seconds=0, shipping=None):
         self.driver, self.jev, self.path, self.plan = driver, jev, Path(journal), plan
         self.clock, self.sleep, self.cached = clock, sleep, None
         digest = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
@@ -224,12 +211,21 @@ class Engine:
             raise Halt('Journal belongs to another purchase plan')
         self.run_started = clock()
         self.sleep_ms = 0
+        self.auth_wait_seconds = max(0, auth_wait_seconds)
+        self.auth_waited = 0
+        self.shipping = shipping
         for previous in self.record['runs']:
             if previous['status'] == 'running':
                 previous['status'] = 'interrupted_without_final_metrics'
         self.record['runs'].append({'started_at': time.time(), 'status': 'running'})
 
     def persist(self):
+        # Persist partial metrics at existing checkpoints; interruption must not erase them.
+        if self.record['runs'] and self.record['runs'][-1]['status'] == 'running':
+            self.record['runs'][-1].update(
+                elapsed_ms=round((self.clock()-self.run_started)*1000),
+                driver_metrics=self.driver.metrics, sleep_ms=round(self.sleep_ms),
+                auth_wait_ms=round(self.auth_waited*1000), jev_calls=self.jev.calls)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix('.tmp')
         with tmp.open('w') as stream:
@@ -250,6 +246,41 @@ class Engine:
         self.sleep(max(0, seconds))
         self.sleep_ms += (self.clock() - started) * 1000
 
+    def wait_for_auth(self):
+        """Keep the same process/journal; the user completes credentials in Chrome."""
+        remaining = self.auth_wait_seconds - self.auth_waited
+        if remaining <= 0:
+            raise Halt('auth_required: complete authentication in Chrome, then resume this journal')
+        started = self.clock()
+        event = {'key': 'auth_wait', 'run_index': len(self.record['runs']) - 1,
+                 'status': 'waiting', 'elapsed_ms': round((started-self.run_started)*1000)}
+        self.record['events'].append(event)
+        self.persist()
+        print(json.dumps({'status': 'auth_waiting', 'timeout_seconds': remaining,
+                          'message': 'Complete authentication in this Chrome window; this process resumes automatically.'}), flush=True)
+        try:
+            while True:
+                state = self.observe()
+                if not state.needs_auth and not state.complete:
+                    state = self.observe(full=True)
+                if not state.needs_auth:
+                    event['status'] = 'auth_screen_left'
+                    return state
+                left = remaining - (self.clock()-started)
+                if left <= 0:
+                    event['status'] = 'timeout'
+                    raise Halt('auth_required: authentication wait expired; resume this same journal')
+                self.pause(min(max(.05, .5-state.read_ms/1000), left))
+                self.cached = None
+        finally:
+            elapsed = self.clock()-started
+            self.auth_waited += elapsed
+            if event['status'] == 'waiting':
+                event['status'] = 'interrupted'
+            event['duration_ms'] = round(elapsed*1000)
+            self.persist()
+            print(json.dumps({'status': event['status'], 'auth_wait_ms': event['duration_ms']}), flush=True)
+
     def wait(self, predicate, label, timeout=None, allow_auth=False):
         deadline = self.clock() + (timeout or self.plan.get('load_timeout_seconds', 120))
         next_full = self.clock()
@@ -261,9 +292,14 @@ class Engine:
                 state = self.observe(full=True)
                 next_full = self.clock() + 1
             if state.needs_auth and not allow_auth:
-                raise Halt('auth_required: complete authentication in Chrome, then resume this journal')
+                started = self.clock()
+                self.wait_for_auth()
+                deadline += self.clock()-started
+                continue
             if predicate(state):
                 return state
+            if state.title.strip() == 'Page Not Found - Apple':
+                raise Halt('page_not_found: inspect the shopping bag before retrying any purchase action')
             if self.clock() >= deadline:
                 raise Halt(f'timeout: {label}; no add or order submission was repeated')
             # One read serves both the previous action's postcondition and the next action.
@@ -280,65 +316,19 @@ class Engine:
         self.driver.open(url)
         self.cached = None
         deadline = self.clock() + self.plan.get('load_timeout_seconds', 120)
-        while True:
-            try:
-                return self.product_wait(ready, {'url': url}, deadline)
-            except ProductReloaded:
-                continue
+        return self.product_wait(ready, {'url': url}, deadline)
 
     def product_wait(self, predicate, product, deadline):
-        """Check before refreshing. Never refresh checkout or an uncertain purchase."""
-        interval = self.plan.get('refresh_interval_seconds', 1)
-        if getattr(self, '_product_refresh_due', None) is None:
-            self._product_refresh_due = self.clock() + interval
-        while True:
-            state = self.observe()
-            if state.needs_auth:
-                raise Halt('auth_required: complete authentication in Chrome, then resume this journal')
-            if predicate(state):
-                self._product_refresh_due = None
-                return state
-            if self.clock() >= deadline:
-                raise Halt('timeout: product unavailable; purchase was not retried')
-            if self.clock() < self._product_refresh_due:
-                remaining = min(self._product_refresh_due-self.clock(), deadline-self.clock())
-                if state.read_ms and remaining <= .03:
-                    self.sleep(remaining)  # Snapshot just finished; don't pay another full AX walk.
-                else:
-                    # Schedule the next read to finish near the tick, not to start after it.
-                    lead = state.read_ms / 1000
-                    self.sleep(max(0, remaining-lead+(.02 if lead else 0)))
-                    self.cached = None
-                    continue
-            if any(m['status'] == 'attempted' and m['kind'] in ('add', 'submit')
-                   for m in self.record['mutations'].values()):
-                raise Halt('pending_mutation: product refresh prohibited')
-            # A control outside the short snapshot must not trigger a reload.
-            if not state.complete:
-                state = self.observe(full=True)
-                if state.needs_auth:
-                    raise Halt('auth_required: complete authentication in Chrome, then resume this journal')
-                if predicate(state):
-                    self._product_refresh_due = None
-                    return state
-            actual = urlsplit(state.url if '://' in state.url else 'https://' + state.url)
-            target = urlsplit(product['url'])
-            if actual.path.startswith('/shop/checkout') or state.at_alipay:
-                raise Halt('Checkout or payment refresh prohibited')
-            if actual.hostname != target.hostname and actual.hostname != target.hostname.removeprefix('www.'):
-                raise Halt('Unexpected host; product refresh prohibited')
-            if actual.path != target.path and not actual.path.startswith(target.path + '/'):
-                raise Halt('Outside product page; refresh prohibited')
-            started = self.clock()
-            self._product_refresh_due = started + interval
-            self.driver.refresh()
-            self.cached = None
-            self.record['refresh_count'] = self.record.get('refresh_count', 0) + 1
-            # Start-to-start cadence; no extra one-second sleep after a slow Cua call.
-            self.record['last_refresh_ms'] = round((self.clock()-started)*1000)
-            raise ProductReloaded
+        """Wait for live controls without reloading a queue or in-flight document."""
+        if any(m['status'] == 'attempted' and m['kind'] in ('add', 'submit')
+               for m in self.record['mutations'].values()):
+            raise Halt('pending_mutation: product configuration prohibited')
+        remaining = deadline - self.clock()
+        if remaining <= 0:
+            raise Halt('timeout: product unavailable; no page refresh performed')
+        return self.wait(predicate, 'product ready; no page refresh performed', timeout=remaining)
 
-    def action(self, key, pattern, goal, postcondition, kind='option', validator=None):
+    def action(self, key, pattern, goal, postcondition, kind='option', validator=None, decision=None):
         # Durable intent is written before dispatch. Unknown outcomes never cause a second click.
         mutation = self.record['mutations'].get(key) if kind in ('add', 'submit') else None
         if mutation:
@@ -353,9 +343,17 @@ class Engine:
         if validator and not any(validator(e) for e in candidates) and not state.complete:
             state = self.observe(full=True)
             candidates = state.controls(pattern)
+        # The authorized exact selection is already in the plan. Do not send
+        # known-wrong alternatives to Jev and pay a request to rediscover it.
+        if validator:
+            candidates = [e for e in candidates if validator(e)]
+            if not candidates:
+                raise Halt(f'No option consistent with the purchase plan: {key}')
         # Duplicate top/bottom checkout buttons have identical meanings.
         unique = {norm(e.get('label')): e for e in candidates}
-        chosen = self.jev.pick(state, list(unique.values()), goal)
+        chosen = decision if decision is not None else self.jev.pick(state, list(unique.values()), goal)
+        if chosen not in candidates:
+            raise Halt('Model selected an inconsistent or stale control')
         if validator and not validator(chosen):
             raise Halt(f'Jev selected an option inconsistent with the purchase plan: {key}')
         if kind != 'option':
@@ -366,33 +364,11 @@ class Engine:
         metric_start, sleep_start = len(self.driver.metrics), self.sleep_ms
         self.driver.click(chosen)
         self.cached = None
-        retries = 0
-        if kind == 'option':
-            try:
-                state = self.wait(postcondition, f'result {key}', timeout=1)
-            except Halt as error:
-                if not str(error).startswith('timeout:'):
-                    raise
-                # A page transition can discard the first radio click. Re-read and
-                # reselect only this same reversible option; never reload or replay add/submit.
-                state = self.wait(lambda s: postcondition(s) or any(
-                    e['role'] == chosen['role'] and semantic(e.get('label')) == semantic(chosen.get('label'))
-                    for e in s.controls(pattern)), f'ready to reconcile {key}', timeout=10)
-                if not postcondition(state):
-                    matches = [e for e in state.controls(pattern) if e['role'] == chosen['role']
-                               and semantic(e.get('label')) == semantic(chosen.get('label'))]
-                    if len(matches) != 1:
-                        raise Halt(f'Ambiguous reversible option after page transition: {key}')
-                    self.driver.click(matches[0])
-                    self.cached = None
-                    retries = 1
-                state = self.wait(postcondition, f'reconciled {key}', timeout=10)
-        else:
-            state = self.wait(postcondition, f'result {key}')
+        state = self.wait(postcondition, f'result {key}')
         if kind != 'option':
             self.record['mutations'][key]['status'] = 'confirmed'
         event = {'key': key, 'action': norm(chosen.get('label')),
-                 'reversible_retries': retries,
+                 'run_index': len(self.record['runs']) - 1,
                  'driver_ms': sum(m['ms'] for m in self.driver.metrics[metric_start:]),
                  'sleep_ms': round(self.sleep_ms - sleep_start),
                  'action_and_wait_ms': round((self.clock()-started)*1000),
@@ -422,49 +398,29 @@ class Engine:
             self.cached = None
         deadline = self.clock() + self.plan.get('product_wait_seconds', 1800)
         waiter = lambda predicate, label: self.product_wait(predicate, product, deadline)
-        if using_entry:
-            initial = self.observe()
-            # Chrome can expose the previous document or disabled radios during
-            # SKU navigation. Let that transition settle before reloading it.
-            # Truly blank/unavailable pages still enter the one-second loop.
-            if any(e.get('role') == 'AXRadioButton' and
-                   re.search(product['options'][0]['pattern'], norm(e.get('label')))
-                   for e in initial.elements):
-                try:
-                    self.wait(lambda s: bool(s.controls(product['options'][0]['pattern']))
-                              and product['name'] in norm(s.title), 'SKU navigation ready', timeout=3)
-                except Halt as error:
-                    if not str(error).startswith('timeout:'):
-                        raise
         # Reversible options are confirmed from the live page, never from a past journal.
         for key in list(self.record['mutations']):
             if key.startswith(prefix + ':'):
                 del self.record['mutations'][key]
-        while True:
-            if self.clock() >= deadline:
-                raise Halt('timeout: product configuration could not remain selected')
-            try:
-                state = waiter(lambda s: bool(s.controls(product['options'][0]['pattern']))
-                               and (not using_entry or product['name'] in norm(s.title)), 'product ready')
-                using_entry = False
-                for option in product['options']:
-                    expected = option['expected']
-                    selected = lambda s, expected=expected: any(e.get('role') == 'AXRadioButton'
-                        and re.search(expected, semantic(e.get('label'))) and str(e.get('value')) == '1' for e in s.elements)
-                    if selected(state):
-                        continue
-                    state = self.action(prefix+':'+option['name'], option['pattern'], option['goal'], selected,
-                                        validator=lambda e, expected=expected: bool(re.search(expected, semantic(e.get('label')))))
-                if require_add:
-                    state = waiter(lambda s: bool(s.controls(r'^添加到购物袋$')), 'available to add')
-                if not all(any(e.get('role') == 'AXRadioButton'
-                               and re.search(option['expected'], semantic(e.get('label')))
-                               and str(e.get('value')) == '1' for e in state.elements)
-                           for option in product['options']):
-                    continue  # A late page transition may have reset an earlier option.
-                return state
-            except ProductReloaded:
-                continue  # Re-evaluate every option after a page reload; cached Jev choices remain usable.
+        state = waiter(lambda s: bool(s.controls(product['options'][0]['pattern']))
+                       and (not using_entry or product['name'] in norm(s.title)), 'product ready')
+        using_entry = False
+        for option in product['options']:
+            expected = option['expected']
+            selected = lambda s, expected=expected: any(e.get('role') == 'AXRadioButton'
+                and re.search(expected, semantic(e.get('label'))) and str(e.get('value')) == '1' for e in s.elements)
+            if selected(state):
+                continue
+            state = self.action(prefix+':'+option['name'], option['pattern'], option['goal'], selected,
+                                validator=lambda e, expected=expected: bool(re.search(expected, semantic(e.get('label')))))
+        if require_add:
+            state = waiter(lambda s: bool(s.controls(r'^添加到购物袋$')), 'available to add')
+        if not all(any(e.get('role') == 'AXRadioButton'
+                       and re.search(option['expected'], semantic(e.get('label')))
+                       and str(e.get('value')) == '1' for e in state.elements)
+                   for option in product['options']):
+            raise Halt('Selected options changed; stopped without repeating clicks')
+        return state
 
     def verify_bag(self, state):
         if not state.complete:
@@ -497,16 +453,17 @@ class Engine:
         if submit and (self.plan.get('max_total') is None or
                        self.plan['expected_total'] > self.plan['max_total']):
             raise Halt('An explicitly authorized price limit is required before submission')
+        address_ready = lambda s: bool(self.shipping and self.shipping.can_restore(s))
         state = self.observe(full=True)
         if '/shop/bag' in state.url:
             state = self.wait(lambda s: s.bag_ready, 'shopping bag ready')
             self.verify_bag(state)
             state = self.action('checkout', r'^结账$', '结账当前购物袋',
-                lambda s: bool(s.controls(r'^(继续填写送货地址|继续选择付款方式|支付宝|检查订单|立即下单)$')),
+                lambda s: bool(s.controls(r'^(继续填写送货地址|继续选择付款方式|支付宝|检查订单|立即下单)$')) or address_ready(s),
                 kind='checkout')
         state = self.wait(lambda s: bool(s.controls(
             r'^(继续填写送货地址|继续选择付款方式|支付宝|检查订单|查看订单|立即下单|提交订单|下订单)$'))
-            or '等待付款' in s.text or s.at_alipay, 'checkout content ready')
+            or address_ready(s) or '等待付款' in s.text or s.at_alipay, 'checkout content ready')
         # Known page controls, not a guessed count of polling iterations.
         stages = [
             ('delivery', r'^继续填写送货地址$', '使用送货上门', r'^继续选择付款方式$'),
@@ -514,11 +471,17 @@ class Engine:
             ('alipay', r'^(支付宝|微信支付|花呗分期|微信分付|信用卡.*)$', '选择支付宝全额付款，不分期', None),
             ('review', r'^(检查订单|查看订单)$', '检查订单', r'^(立即下单|提交订单|下订单)$')]
         for key, pattern, goal, next_pattern in stages:
-            state = self.observe(full=True)
+            state = self.observe()
+            if key == 'address' and address_ready(state):
+                state = self.shipping.restore(self)
+            if not state.controls(pattern) and not state.complete:
+                state = self.observe(full=True)
             if state.controls(r'^(立即下单|提交订单|下订单)$') or '等待付款' in state.text or state.at_alipay:
                 break
             if state.needs_auth:
-                raise Halt('auth_required: complete authentication in Chrome, then resume this journal')
+                state = self.wait(lambda s: not s.needs_auth and bool(s.controls(
+                    r'^(继续填写送货地址|继续选择付款方式|支付宝|检查订单|查看订单|立即下单|提交订单|下订单)$') or address_ready(s)),
+                    'checkout after authentication')
             if not state.controls(pattern):
                 continue  # Resume from the currently observed later page.
             if key == 'alipay':
@@ -528,7 +491,8 @@ class Engine:
                                     validator=lambda e: norm(e.get('label')) == '支付宝')
             else:
                 state = self.action(key, pattern, goal,
-                                    lambda s, next_pattern=next_pattern: bool(s.controls(next_pattern)), kind='checkout')
+                                    lambda s, next_pattern=next_pattern, key=key: bool(s.controls(next_pattern))
+                                    or (key == 'delivery' and address_ready(s)), kind='checkout')
         state = self.wait(lambda s: bool(s.controls(r'^(立即下单|提交订单|下订单)$'))
                            or '等待付款' in s.text or s.at_alipay, 'order review or existing outcome')
         if state.at_alipay:
@@ -559,9 +523,24 @@ class Engine:
 
     def finish(self, status):
         self.record['runs'][-1].update(status=status, elapsed_ms=round((self.clock()-self.run_started)*1000))
+        if self.cached is not None:
+            # Diagnose the last observed state without persisting URL tokens,
+            # private paths, titles containing account data, or page contents.
+            u = urlsplit(self.cached.url if '://' in self.cached.url else 'https://' + self.cached.url)
+            route = next((name for prefix, name in (
+                ('/shop/buy-iphone/', 'product'), ('/shop/bag', 'bag'),
+                ('/shop/checkout', 'checkout'), ('/shop/signIn', 'auth'),
+                ('/shop/sorry/', 'store_error')) if u.path.startswith(prefix)), 'other')
+            self.record['runs'][-1]['last_observed_page'] = {
+                'route_kind': route,
+                'page_not_found': self.cached.title.strip() == 'Page Not Found - Apple',
+                'maintenance_notice': '来得早，来得好。' in self.cached.text,
+                'add_form_parameters_in_url': 'add-to-cart' in dict(parse_qsl(u.query)),
+            }
         self.record['runs'][-1]['driver_metrics'] = self.driver.metrics
         self.record['runs'][-1]['jev_calls'] = self.jev.calls
         self.record['runs'][-1]['sleep_ms'] = round(self.sleep_ms)
+        self.record['runs'][-1]['auth_wait_ms'] = round(self.auth_waited*1000)
         self.record['status'] = status
         self.record['driver_metrics'] = self.driver.metrics
         self.record['jev_calls'] = self.jev.calls
@@ -577,9 +556,27 @@ class Engine:
 def run(a):
     plan = json.loads(Path(a.plan).read_text())
     driver, jev = Cua(window_id=a.window_id), Jev()
-    engine = Engine(driver, jev, a.journal, plan)
+    shipping = None
+    if getattr(a, 'shipping_backup', None):
+        from shipping_backup import ShippingBackup
+        shipping = ShippingBackup(a.shipping_backup)
+    engine = Engine(driver, jev, a.journal, plan,
+                    auth_wait_seconds=getattr(a, 'auth_wait_seconds', 0), shipping=shipping)
+    if engine.record.get('status') == 'alipay_reached':
+        print(json.dumps({'status': 'alipay_reached', 'already_completed': True}), flush=True)
+        return
     try:
+        engine.persist()
         driver.bind()
+        # A human may have advanced checkout while a previous run was interrupted.
+        # Inspect once on resume, never navigate back to a stale configuration phase.
+        if len(engine.record['runs']) > 1:
+            live = engine.observe(full=True)
+            u = urlsplit(live.url if '://' in live.url else 'https://' + live.url)
+            apple_checkout = (u.hostname == 'apple.com.cn' or
+                              (u.hostname or '').endswith('.apple.com.cn')) and u.path.startswith('/shop/checkout')
+            if apple_checkout or live.at_alipay:
+                engine.checkpoint('checkout')
         if not a.resume_checkout and engine.record.get('phase') != 'checkout':
             phase = engine.record.get('phase', 'new')
             if phase == 'new' and a.stop_at != 'configure':
@@ -625,19 +622,9 @@ def run(a):
         raise SystemExit(2) from None
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('--plan', required=True)
-    p.add_argument('--journal', required=True)
-    p.add_argument('--stop-at', choices=['configure', 'bag', 'review'], default='review')
-    p.add_argument('--resume-checkout', action='store_true')
-    p.add_argument('--window-id', type=int, help='Exact Chrome work window; avoids active-window races')
-    p.add_argument('--submit', action='store_true', help='Actually submits one order; requires user authorization')
-    a = p.parse_args()
-    try:
-        with journal_lock(a.journal):
-            run(a)
-    except Halt as error:
-        p.exit(2, str(error) + '\n')
+    # All command-line purchases use the model-led policy, including the old filename.
+    from jev_agent import main as agent_main
+    return agent_main()
 
 if __name__ == '__main__':
     main()

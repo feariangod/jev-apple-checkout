@@ -72,6 +72,5 @@
   "load_timeout_seconds": 120,
   "release_at": "2026-10-16T20:00:00+08:00",
   "payment": "支付宝全额付款",
-  "refresh_interval_seconds": 1,
   "product_wait_seconds": 1800
 }

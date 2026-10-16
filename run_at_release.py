@@ -23,6 +23,8 @@ def main():
     parser.add_argument('--window-id', type=int)
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--submit', action='store_true', help='Explicitly enable order submission; never pays')
+    parser.add_argument('--shipping-backup')
+    parser.add_argument('--auth-wait-seconds', type=float, default=300)
     args = parser.parse_args()
     plan_path = Path(args.plan).resolve()
     journal = Path(args.journal).resolve()
@@ -47,8 +49,11 @@ def main():
         time.sleep(min(remaining, 0.1 if remaining < 2 else 1))
     if launch_state(datetime.now(timezone.utc), release) != 'ready':
         parser.error('release window expired while waiting')
-    command = [sys.executable, str(Path(__file__).with_name('purchase_runner.py')),
+    command = [sys.executable, str(Path(__file__).with_name('jev_agent.py')),
                '--plan', str(plan_path), '--journal', str(journal), '--window-id', str(args.window_id)]
+    command.extend(['--auth-wait-seconds', str(args.auth_wait_seconds)])
+    if args.shipping_backup:
+        command.extend(['--shipping-backup', args.shipping_backup])
     if args.submit:
         command.append('--submit')
     return subprocess.call(command)

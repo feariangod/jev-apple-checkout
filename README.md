@@ -1,25 +1,23 @@
-# Jev + Cua 苹果中国官网购买工作流
+# Jev 决策 + Cua 执行：苹果中国官网购买工作流
 
-在本机已登录的 Chrome 中，用 Jev 选择页面选项、Cua 执行操作、Python 连续控制选配和结账。默认停在订单确认页；显式传入 `--submit` 才会提交订单并打开支付宝，**不会实际付款**。
+Jev 根据当前页面的去隐私状态选择下一步，Cua 在本机 Chrome 中执行。Python 只提供允许的操作、等待条件、商品与预算约束和防重复提交。即使候选操作只有一个，也调用 Jev；无模型缓存、唯一候选捷径或模型失败后的脚本代选。
 
-这是苹果网站专用执行器，并非上游 Jev Agent 的完整复制。支持 macOS 原生 Cua；未验证 Windows/Linux 的真实浏览器操作。测试在其他系统上只运行模拟驱动。
+默认到订单确认页；显式 `--submit` 才提交一笔订单并打开支付宝。**不实际付款，不刷新页面，不自动重发点击。** 这是苹果网站专用的受约束智能体，不是可操作任意网页的通用模型。
 
-## 组件与分工
+## 分工
 
-| 组件 | 分工 |
+|组件|职责|
 |---|---|
-| Jev `jev-1.13.0` | 通过 TypeSafe API，在当前页面候选控件中选择；相同候选和目标缓存结果 |
-| Cua Driver | 通过 macOS 无障碍树读取、点击和导航已登录的 Chrome，通常不截屏 |
-| `purchase_runner.py` | 连续执行、等待、预算与商品检查、一次提交、进度恢复 |
-| `run_at_release.py` | 提前运行后按系统时钟等待开售时间，不是后台调度服务 |
-| Codex 或其他操作员 | 提前启动程序、处理登录/验证码及异常，不逐次接管点击 |
-| 用户 | 完成必要认证，最终在支付宝自行付款 |
+|Jev `jev-1.13.0`|根据当前产品、已选项、已确认加购及允许动作，选择导航、选配、加购、结账、提交或等待|
+|Cua Driver|读取原生无障碍树，执行模型选定动作；通常不截图|
+|本地约束层|排除未授权商品和动作，核对数量、金额和支付宝域名，记录交易意图；不会替模型选择下一步|
+|用户|完成验证码、Touch ID等认证；自行决定最终付款|
 
-不需要 Browser Harness、Playwright、额外文字生成模型或 TypeSafe MCP 服务。API 密钥必须由你自己提供。模型看到的是当前候选控件与目标，程序不主动发送收货地址、密码或验证码。
+下一步依据实时页面，不按固定步骤序号点击。多个合法选项同时可用时，Jev决定顺序。已满足的选项不再作为候选。没有可操作控件时本地只读等待；排队、空白加载和选配水合均不重载页面。模型选择WAIT会等待；BLOCKED或异常会停止并保存进度。
 
 ## 安装
 
-需要 Python 3.12+、本机 Chrome、已安装并获 macOS 所需权限的 `cua-driver`。驱动请从 [Cua 官方项目](https://github.com/trycua/cua) 按当前安装说明获取。本机实测驱动版本为 0.27.0；新版本兼容性需自行验证。此项目不安装、升级驱动或修改系统权限。
+需要 Python 3.12+、macOS Chrome，以及已安装并获得系统权限的 [Cua Driver](https://github.com/trycua/cua)。实测驱动版本0.27.0。Linux CI仅验证模拟驱动，不代表支持Linux实际桌面。
 
 ```sh
 git clone https://github.com/feariangod/jev-apple-checkout.git
@@ -27,83 +25,65 @@ cd jev-apple-checkout
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[test]'
-cua-driver --help
-cua-driver permissions status
 python -m pytest -q
-```
-
-通过当前终端或密码管理器设置 `TYPESAFE_API_KEY`。可选环境变量：`TYPESAFE_MODEL`（默认 `jev-1.13.0`）、`CUA_DRIVER`（驱动可执行文件路径）。`.env.example` 仅作格式参考，不会自动加载；不要提交真实 `.env`。程序不会读取 Codex 全局凭据文件。
-
-## 准备计划
-
-`plans/*.example.json` 是历史测试配置示例，包含商品路径、页面标签、预算和 SKU 直达链接，**不保证未来仍有效或有库存**。先核对实际官网，再复制并编辑自己的计划。价格、开售日期、数量均须由操作员确认。改变计划后不能继续使用旧计划的交易进度。
-
-每次运行前：保持电脑唤醒且解锁；打开并登录苹果中国商店；准备收货地址；确认购物袋为空。列出窗口并选定准确的 Chrome 窗口 ID：
-
-```sh
+cua-driver permissions status
 cua-driver call list_windows '{}'
 ```
 
-以下 `WINDOW_ID` 必须替换为本次观察到的编号，不使用历史窗口编号。
+通过终端或密码管理器设置你自己的 `TYPESAFE_API_KEY`。可选 `TYPESAFE_MODEL`、`CUA_DRIVER`。程序不读取Codex全局配置或其他应用凭据；`.env.example`不会自动加载。无需Browser Harness、Playwright或额外文字生成模型。
 
-## 执行
+## 连续运行
 
-先只测选配，不加入购物袋：
-
-```sh
-python purchase_runner.py --plan plans/pro-two.example.json \
-  --journal run/config-test.json --window-id WINDOW_ID --stop-at configure
-```
-
-完整选配、加购、进入订单确认页，**不提交订单**：
+先确认官网实际配置、价格、数量和授权预算，再将 `plans/*.example.json` 复制到自己的计划文件。示例商品路径和日期是历史数据，不保证仍有效。保持电脑唤醒解锁、Chrome登录，起始购物袋必须为空。`WINDOW_ID`替换为刚观察到的Chrome窗口编号。
 
 ```sh
-python purchase_runner.py --plan plans/pro-two.example.json \
+# 默认只到确认页
+python jev_agent.py --plan plans/duo-two.example.json \
   --journal run/purchase.json --window-id WINDOW_ID
-```
 
-只有明确决定新建真实订单时，才使用以下命令。它会提交计划中的一笔订单，并停在支付宝，不付款：
-
-```sh
-python purchase_runner.py --plan plans/pro-two.example.json \
+# 只有明确授权创建真实订单时才加 --submit
+python jev_agent.py --plan plans/duo-two.example.json \
   --journal run/purchase.json --window-id WINDOW_ID --submit
 ```
 
-真实路径：SKU 链接 → 选配第一台 → 加购 → 选配第二台 → 加购 → 查看一次购物袋 → 自动检查商品/数量/预算 → 结账 → 已保存地址 → 支付宝 → 检查订单 → 提交一次 → 打开支付宝 → 停止。
+不需要先跑一遍选配测试才能正式运行。一次正常路径是：模型选择检查空购物袋、选择要配置的商品和可执行选项、各加购一次、查看合并购物袋、结账、沿用地址、支付宝、检查订单、提交、打开支付宝。每个选择都来自一次Jev响应，本地约束可拒绝不合法选择。
 
-已选中的项目直接跳过；明确且唯一的按钮直接点击；需要选项判断才调用 Jev。同一页面读取服务于前后步骤。不同测试模式各用独立测试 journal；一旦开始某笔真实购买，所有恢复必须沿用该购买 journal，不能另建进度重试。
+`auth_waiting`出现时，操作员立即通知用户。用户在苹果页面认证后同一进程自动续跑，默认最多累计等待300秒，可用 `--auth-wait-seconds`设置。只监控简短输出，不由助手逐屏接管、不并行操纵同一窗口。
 
-## 登录与故障恢复
+## 停止与恢复
 
-遇到登录/验证码时在苹果页面完成认证，再用**同一计划、同一 journal**重跑同一命令。登录过商店不保证安全结账不再认证。勿输出密码、验证码或原始个人页面数据。
+模型或页面失败就保留同一journal，修复具体原因后用同一命令恢复。加购/提交已尝试而结果未确认时停止，必须先检查真实订单或购物袋；不能新建journal绕过，也不能自动删除未确认意图。订单完成后同一journal直接退出，不再次操作。
 
-加购和提交前持久化意图；结果不明确时只核实结果，不盲目重发。不要删除 journal、手动改成“成功”、启动另一份购买。进程锁仅防止同一 journal 并发；操作员必须避免不同 journal/任务同时操作同一购物袋或窗口。
+正常人工认证可以同进程接续；人工改变购物袋、切页或操作订单时应先停止执行器，再核实状态。不假设任意人工改变都能自动修复。不同journal的锁不互斥，禁止两个进程同时操作同一窗口或购物袋。
 
-## 定时开售
+`purchase_runner.py`保留共用驱动、验证原语及历史回归测试，正式入口是 `jev_agent.py` / `jev-apple-checkout`。旧每秒刷新参数、刷新重选和丢失点击后重点击不再执行。
 
-提前检查登录与窗口；用 Codex 线程自动化等调度器在开售前约 10 分钟启动下列进程。此仓库不会创建自动化或常驻任务，也不会自动保持电脑唤醒。
+## 地址与隐私
+
+官网地址和联系方式完整时直接继续，不要求用户重复确认。可通过 `--shipping-backup /outside/repository/shipping.json`提供本机私有备用信息；模型仅决定是否请求补填，实际字段值由本机绑定到原生控件，不发送给模型。配置必须归当前用户所有且权限0600。区域控件或非空内容冲突则停止，不猜地址。
+
+备用格式为 `version: 1`，`fields`包含姓氏、名字、收货地址：、详细地址、附加详细地址、收件人手机号码；`contact`包含电子邮件地址、联系人手机号码。省市区用空格分隔为三段。不得保存掩码作为完整信息。公开仓库不含任何真实备用配置。
+
+模型只收到商品计划、已选配置的布尔状态、脱敏动作标签及已完成操作；不收到原始页面全文、账户标题、地址、输入框值、订单号或带令牌URL。journal仍可能包含订单号，属于本机私有文件，不能上传。不要公开截图、付款链接、原始日志、API密钥或浏览器状态。
+
+## 定时启动
+
+外部调度器提前启动本地入口；它不是后台服务。确保日期、时区、预算及购买授权正确。
 
 ```sh
-python run_at_release.py --plan plans/duo-two.example.json \
-  --journal run/release-purchase.json --check
-
-# 真正执行：必须提前确认日期、预算及购买授权
-python run_at_release.py --plan plans/duo-two.example.json \
-  --journal run/release-purchase.json --window-id WINDOW_ID --submit
+python run_at_release.py --plan plans/duo-two.example.json --journal run/release.json --check
+python run_at_release.py --plan plans/duo-two.example.json --journal run/release.json \
+  --window-id WINDOW_ID --submit
 ```
 
-`release_at` 必须含时区。提前超过 30 分钟或晚于开售 30 分钟拒绝新启动；睡眠导致错过窗口时也拒绝补买。计时精度、网络、库存和认证均不能保证。`--submit` 未传入时仍只到确认页。
+首次导航到计划页面由Jev决策，开售时间只代表允许开始，不保证官网已开放。官方排队不刷新；超时不循环重启。计时入口拒绝在开售前超过30分钟或开售后30分钟才启动；已有进程的等待另有期限，不保证完成时间。
 
-商品尚不可选时目标每秒刷新；已可选后开始选配。结账、认证、未知提交结果及支付宝不周期刷新。高拥堵下每秒刷新可能打断慢响应，可调整计划的 `refresh_interval_seconds`。
+## 验证与实测口径
 
-## 实测边界
+每次模型响应打印 `jev_decision`，journal记录模型版本、延迟及调用数，不保留请求全文。报告必须区分总墙钟时间、执行时间、认证等待、修复间隔及人工操作。
 
-历史两台 Pro 完整测试：从执行器进程启动到支付宝 83.188 秒，无登录暂停，已提交、未付款。Duo 只验证过选配和未开放预购状态，不能将其约 10–15 秒的成绩当成完整下单成绩。原始订单、个人运行日志均未包含在仓库。
+之前110.749秒的两台Duo测试是确定性脚本+Cua，Jev调用0次，不能作为本版本Jev决策成绩。模拟测试验证模型决定不同选配顺序、唯一候选仍调用模型、失败无脚本后备、地址隐私及一次提交。测试通过不等于官网始终可购买。
 
-Cua 曾出现窗口定位异常、菜单作用于其他活动窗口及空响应。执行器在导航/刷新前置前目标窗口，但这不是完全消除驱动问题的保证。发生异常先检查准确窗口和现有结果，再恢复；不为测速重复提交订单。修改此仓库不代表原机上的定时任务已自动切换到新版本。
+源代码采用MIT许可证，第三方署名见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-实现、示例与模拟测试可审查；测试通过不等于真实网站随时可购买。上游代码来源与许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-## 许可证与贡献
-
-工作流以 MIT 许可证提供，可修改复用；第三方代码保留原始署名。提交 Issue 时请先删除订单号、收货信息、支付链接和 API 密钥，不要上传原始浏览器快照或 journal。
+最新独立实测：**115.804秒到支付宝，17次真实Jev调用，0刷新、1次提交，未付款**。其中认证等待11.812秒、模型请求合计13.737秒，均已包含在总耗时内。详细口径见 [实测记录](docs/benchmark.md)。

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jev-apple-checkout"
-version = "0.1.0"
+version = "0.2.0"
 description = "Jev choice model and native Cua workflow for Apple China checkout"
 requires-python = ">=3.12"
 dependencies = ["httpx[http2]>=0.28,<1"]
@@ -13,10 +13,10 @@ dependencies = ["httpx[http2]>=0.28,<1"]
 test = ["pytest>=8.4,<9"]
 
 [project.scripts]
-jev-apple-checkout = "purchase_runner:main"
+jev-apple-checkout = "jev_agent:main"
 
 [tool.setuptools]
-py-modules = ["purchase_runner", "run_at_release"]
+py-modules = ["purchase_runner", "jev_agent", "shipping_backup", "run_at_release"]
 packages = ["jev_choice"]
 
 [tool.setuptools.package-data]
